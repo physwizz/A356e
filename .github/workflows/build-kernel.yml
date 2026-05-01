@@ -1,0 +1,204 @@
+name: Build A356e Kernel (KernelSU)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+
+      # ─── 1. Checkout kernel source ───────────────────────────────
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          path: kernel
+
+      # ─── 2. Install dependencies ──────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            bc bison flex libssl-dev libelf-dev \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            make git curl python3 python-is-python3 \
+            cpio lz4 zstd tar gzip zip
+
+      # ─── 3. Download Clang r450784d (same as build_kernel.sh) ────
+      - name: Cache Clang toolchain
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: toolchain/clang
+          key: clang-r450784d-v2
+
+      - name: Download Clang r450784d
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p toolchain/clang/host/linux-x86/clang-r450784d
+          curl -L \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r450784d.tar.gz" \
+            -o /tmp/clang.tar.gz
+          tar -xzf /tmp/clang.tar.gz \
+            -C toolchain/clang/host/linux-x86/clang-r450784d
+          rm /tmp/clang.tar.gz
+
+      # ─── 4. Download kernel prebuilt build-tools ─────────────────
+      - name: Cache kernel build-tools
+        id: buildtools-cache
+        uses: actions/cache@v4
+        with:
+          path: toolchain/prebuilts/kernel-build-tools
+          key: kernel-build-tools-v2
+
+      - name: Download kernel build-tools
+        if: steps.buildtools-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 \
+            https://android.googlesource.com/platform/prebuilts/kernel-build-tools \
+            toolchain/prebuilts/kernel-build-tools
+
+      # ─── 5. Download build/kernel tools (path/linux-x86) ─────────
+      - name: Cache build/kernel tools
+        id: build-kernel-cache
+        uses: actions/cache@v4
+        with:
+          path: toolchain/build
+          key: build-kernel-tools-v2
+
+      - name: Download build/kernel tools
+        if: steps.build-kernel-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 \
+            https://android.googlesource.com/kernel/build \
+            toolchain/build/kernel
+
+      # ─── 6. Add KernelSU (rksu) ───────────────────────────────────
+      - name: Integrate KernelSU (rksu)
+        working-directory: kernel
+        run: |
+          echo "==> Adding KernelSU (rksu)..."
+          curl -LSs "https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh" \
+            | bash -s main
+          echo "==> KernelSU added."
+
+      # ─── 7. Set up build environment ──────────────────────────────
+      - name: Set up build environment
+        run: |
+          CLANG_BIN="$(pwd)/toolchain/clang/host/linux-x86/clang-r450784d/bin"
+          BUILD_TOOLS="$(pwd)/toolchain/build/kernel/build-tools/path/linux-x86"
+          PREBUILTS="$(pwd)/toolchain/prebuilts/kernel-build-tools/linux-x86"
+          SYSROOT="$(pwd)/toolchain/build/kernel/build-tools/sysroot"
+
+          echo "PATH=${CLANG_BIN}:${BUILD_TOOLS}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" >> $GITHUB_ENV
+          echo "ARCH=arm64"                    >> $GITHUB_ENV
+          echo "TARGET_SOC=s5e8835"            >> $GITHUB_ENV
+          echo "LLVM=1"                        >> $GITHUB_ENV
+          echo "LLVM_IAS=1"                    >> $GITHUB_ENV
+          echo "DEPMOD=depmod"                 >> $GITHUB_ENV
+          echo "DTC_FLAGS=-@"                  >> $GITHUB_ENV
+          echo "PLATFORM_VERSION=15"           >> $GITHUB_ENV
+          echo "ANDROID_MAJOR_VERSION=v"       >> $GITHUB_ENV
+          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          echo "HOSTCFLAGS=--sysroot=${SYSROOT} -I${PREBUILTS}/include" >> $GITHUB_ENV
+          echo "HOSTLDFLAGS=--sysroot=${SYSROOT} -Wl,-rpath,${PREBUILTS}/lib64 -L${PREBUILTS}/lib64 -fuse-ld=lld --rtlib=compiler-rt" >> $GITHUB_ENV
+
+          echo "=== Clang version ==="
+          ${CLANG_BIN}/clang --version
+
+      # ─── 8. Generate .config ──────────────────────────────────────
+      - name: make defconfig
+        working-directory: kernel
+        run: |
+          make s5e8835-a35xjvxx_defconfig
+
+      # ─── 9. Enable KernelSU + disable Samsung anti-root ──────────
+      - name: Enable KernelSU and disable Samsung protections
+        working-directory: kernel
+        run: |
+          # KernelSU (rksu - manual hook, no kprobes needed)
+          ./scripts/config --enable  CONFIG_KSU
+          ./scripts/config --enable  CONFIG_KSU_MANUAL_HOOK
+          ./scripts/config --disable CONFIG_KPROBES
+          ./scripts/config --disable CONFIG_HAVE_KPROBES
+          ./scripts/config --disable CONFIG_KPROBE_EVENTS
+
+          # Disable Samsung anti-root (UH, RKP, defex, proca)
+          ./scripts/config --disable CONFIG_UH
+          ./scripts/config --disable CONFIG_UH_RKP
+          ./scripts/config --disable CONFIG_RKP
+          ./scripts/config --disable CONFIG_KDP
+          ./scripts/config --disable CONFIG_KDP_CRED
+          ./scripts/config --disable CONFIG_SECURITY_DEFEX
+          ./scripts/config --disable CONFIG_PROCA
+          ./scripts/config --disable CONFIG_FIVE
+
+          # Integrity
+          ./scripts/config --disable CONFIG_INTEGRITY
+          ./scripts/config --disable CONFIG_INTEGRITY_SIGNATURE
+          ./scripts/config --disable CONFIG_INTEGRITY_ASYMMETRIC_KEYS
+          ./scripts/config --disable CONFIG_INTEGRITY_TRUSTED_KEYRING
+          ./scripts/config --disable CONFIG_INTEGRITY_AUDIT
+
+          # Module force load
+          ./scripts/config --enable CONFIG_MODULE_FORCE_LOAD
+          ./scripts/config --enable CONFIG_MODULE_UNLOAD
+          ./scripts/config --enable CONFIG_MODULE_FORCE_UNLOAD
+
+          # Kallsyms (for Apatch compatibility)
+          ./scripts/config --enable CONFIG_KALLSYMS
+          ./scripts/config --enable CONFIG_KALLSYMS_ALL
+
+          # Build Image.gz as well
+          ./scripts/config --enable CONFIG_KERNEL_GZIP
+
+          # Regenerate config cleanly
+          make olddefconfig
+
+          echo "=== KSU + security config check ==="
+          grep -E "CONFIG_KSU|CONFIG_UH|CONFIG_SECURITY_DEFEX|CONFIG_PROCA|CONFIG_INTEGRITY=" .config
+
+      # ─── 10. Build kernel ─────────────────────────────────────────
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          make -j$(nproc) 2>&1 | tee build.log
+          echo ""
+          echo "=== Build complete ==="
+          ls -lh arch/arm64/boot/Image    2>/dev/null || echo "Image not found"
+          ls -lh arch/arm64/boot/Image.gz 2>/dev/null || echo "Image.gz not found"
+
+      # ─── 11. Package output ───────────────────────────────────────
+      - name: Package output
+        run: |
+          mkdir -p output
+          cp kernel/arch/arm64/boot/Image    output/ 2>/dev/null || true
+          cp kernel/arch/arm64/boot/Image.gz output/ 2>/dev/null || true
+          cp kernel/.config                  output/kernel.config
+          cp kernel/build.log                output/build.log
+          ls -lh output/
+
+      # ─── 12. Upload kernel artifacts ─────────────────────────────
+      - name: Upload kernel Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: A356e-kernel-KSU-${{ github.sha }}
+          path: |
+            output/Image
+            output/Image.gz
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload logs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.sha }}
+          path: |
+            output/build.log
+            output/kernel.config
+          retention-days: 7
