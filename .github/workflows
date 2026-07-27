@@ -1,0 +1,579 @@
+name: Build Kernels
+
+on:
+    workflow_dispatch:
+        inputs:
+            build_all:
+                description: "Build ALL variants (Overrides individual choices below)"
+                required: false
+                default: true
+                type: boolean
+            build_clean:
+                description: "Build: clean (No Root)"
+                required: false
+                default: false
+                type: boolean
+            build_permissive:
+                description: "Build: permissive (SELinux Permissive)"
+                required: false
+                default: false
+                type: boolean
+            build_ksu:
+                description: "Build: ksu (KernelSU)"
+                required: false
+                default: false
+                type: boolean
+            build_ksunext:
+                description: "Build: ksunext (KernelSU-Next)"
+                required: false
+                default: false
+                type: boolean
+            build_ksu_susfs:
+                description: "Build: ksu-susfs (KernelSU + SUSFS)"
+                required: false
+                default: false
+                type: boolean
+            build_ksunext_susfs:
+                description: "Build: ksunext-susfs (KernelSU-Next + SUSFS)"
+                required: false
+                default: false
+                type: boolean
+            prerelease:
+                description: "Mark the GitHub release as a prerelease"
+                required: false
+                default: false
+                type: boolean
+            notifications:
+                description: "Telegram: post release messages"
+                required: false
+                default: false
+                type: boolean
+
+permissions:
+    contents: write
+    actions: write
+
+concurrency:
+    group: build-kernels-${{ github.ref }}
+    cancel-in-progress: false
+
+env:
+    TOOLCHAIN_DIR: /home/runner/toolchain/clang-r450784d
+
+defaults:
+    run:
+        shell: bash
+
+jobs:
+    setup-matrix:
+        name: Setup Build Matrix
+        runs-on: ubuntu-latest
+        outputs:
+            matrix: ${{ steps.set-matrix.outputs.matrix }}
+        steps:
+            - id: set-matrix
+              run: |
+                BUILD_ALL="${{ github.event.inputs.build_all }}"
+                BUILD_CLEAN="${{ github.event.inputs.build_clean }}"
+                BUILD_PERMISSIVE="${{ github.event.inputs.build_permissive }}"
+                BUILD_KSU="${{ github.event.inputs.build_ksu }}"
+                BUILD_KSUNEXT="${{ github.event.inputs.build_ksunext }}"
+                BUILD_KSU_SUSFS="${{ github.event.inputs.build_ksu_susfs }}"
+                BUILD_KSUNEXT_SUSFS="${{ github.event.inputs.build_ksunext_susfs }}"
+                
+                SELECTED_VARIANTS=()
+                if [ "$BUILD_ALL" = "true" ] || [ -z "$BUILD_ALL" ]; then
+                  SELECTED_VARIANTS=("clean" "permissive" "ksu" "ksunext" "ksu-susfs" "ksunext-susfs")
+                else
+                  [ "$BUILD_CLEAN" = "true" ] && SELECTED_VARIANTS+=("clean")
+                  [ "$BUILD_PERMISSIVE" = "true" ] && SELECTED_VARIANTS+=("permissive")
+                  [ "$BUILD_KSU" = "true" ] && SELECTED_VARIANTS+=("ksu")
+                  [ "$BUILD_KSUNEXT" = "true" ] && SELECTED_VARIANTS+=("ksunext")
+                  [ "$BUILD_KSU_SUSFS" = "true" ] && SELECTED_VARIANTS+=("ksu-susfs")
+                  [ "$BUILD_KSUNEXT_SUSFS" = "true" ] && SELECTED_VARIANTS+=("ksunext-susfs")
+                fi
+                
+                if [ ${#SELECTED_VARIANTS[@]} -eq 0 ]; then
+                  SELECTED_VARIANTS=("clean" "permissive" "ksu" "ksunext" "ksu-susfs" "ksunext-susfs")
+                fi
+                
+                SEL_ARRAY=$(printf '%s\n' "${SELECTED_VARIANTS[@]}" | jq -R . | jq -s -c .)
+                
+                JSON='[
+                  {"variant": "clean", "kernelsu": "none", "susfs": "false", "permissive": "false", "localversion": "-bizarrekernel-clean"},
+                  {"variant": "permissive", "kernelsu": "none", "susfs": "false", "permissive": "true", "localversion": "-bizarrekernel-permissive"},
+                  {"variant": "ksu", "kernelsu": "ksu", "susfs": "false", "permissive": "false", "localversion": "-bizarrekernel-ksu"},
+                  {"variant": "ksunext", "kernelsu": "ksunext", "susfs": "false", "permissive": "false", "localversion": "-bizarrekernel-ksunext"},
+                  {"variant": "ksu-susfs", "kernelsu": "ksu", "susfs": "true", "permissive": "false", "localversion": "-bizarrekernel-ksu+susfs"},
+                  {"variant": "ksunext-susfs", "kernelsu": "ksunext", "susfs": "true", "permissive": "false", "localversion": "-bizarrekernel-ksunext+susfs"}
+                ]'
+                
+                COMPACT_JSON=$(echo "$JSON" | jq --argjson sel "$SEL_ARRAY" -c '{include: map(select(.variant as $v | $sel | index($v)))}')
+                echo "matrix=$COMPACT_JSON" >> $GITHUB_OUTPUT
+
+    build:
+        name: Build Bizarre Kernel (${{ matrix.variant }})
+        needs: setup-matrix
+        runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix: "${{ fromJson(needs.setup-matrix.outputs.matrix) }}"
+        env:
+            BUILD_LOCALVERSION: ${{ matrix.localversion }}
+
+        steps:
+            - name: Free disk space
+              uses: endersonmenezes/free-disk-space@v3
+              with:
+                  remove_android: true
+                  remove_dotnet: true
+                  remove_haskell: true
+                  remove_tool_cache: true
+                  remove_swap: true
+
+            - name: Checkout Kernel Source
+              uses: actions/checkout@v4
+
+            - name: Set date and start time
+              run: |
+                  echo "DATE=$(date +'%Y-%m-%d')" >> "$GITHUB_ENV"
+                  echo "START_TIME=$(date +%s)" >> "$GITHUB_ENV"
+                  echo "📅 Build date: $(date +'%Y-%m-%d %H:%M:%S UTC')"
+
+            - name: Install dependencies
+              env:
+                  DEBIAN_FRONTEND: noninteractive
+              run: |
+                  echo "📦 Updating package lists..."
+                  sudo apt-get update -qq
+                  echo "📦 Installing build dependencies..."
+                  sudo apt-get install -y -qq \
+                    git device-tree-compiler lz4 xz-utils zlib1g-dev openjdk-17-jdk gcc g++ python3 python-is-python3 \
+                    p7zip-full android-sdk-libsparse-utils erofs-utils default-jdk gnupg flex bison gperf build-essential \
+                    zip curl libc6-dev libncurses-dev libx11-dev libreadline-dev libgl1 libgl1-mesa-dev bc grep tofrodos \
+                    python3-markdown libxml2-utils xsltproc libtinfo6 make repo cpio kmod openssl libelf-dev pahole \
+                    libssl-dev libarchive-tools zstd rsync --fix-missing
+                  echo "✅ All dependencies installed"
+
+            - name: Setup Clang Toolchain
+              run: |
+                  mkdir -p "${{ env.TOOLCHAIN_DIR }}"
+                  echo "⬇️  Cloning Bizarre Clang r450784d toolchain..."
+                  git clone --depth=1 https://github.com/TheBizarreAbhishek/clang-r450784d.git "${{ env.TOOLCHAIN_DIR }}"
+                  echo "${{ env.TOOLCHAIN_DIR }}/bin" >> $GITHUB_PATH
+                  echo "✅ Toolchain ready"
+
+            - name: Fetch AnyKernel3
+              run: |
+                  echo "⬇️  Cloning TheBizarreAbhishek/AnyKernel3..."
+                  git clone --depth=1 --branch bizarre https://github.com/TheBizarreAbhishek/AnyKernel3.git "$HOME/AnyKernel3"
+                  echo "✅ AnyKernel3 ready"
+
+            - name: Import KernelSU
+              if: matrix.kernelsu != 'none'
+              run: |
+                  set -euo pipefail
+                  cd "$GITHUB_WORKSPACE"
+                  if [[ "${{ matrix.kernelsu }}" == "ksunext" ]]; then
+                    if [[ "${{ matrix.susfs }}" == "true" ]]; then
+                      echo "🔧 Integrating KernelSU Next (pershoot dev-susfs)..."
+                      curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/next-susfs/kernel/setup.sh" | bash -s dev-susfs
+                      echo "✅ KernelSU-Next (pershoot dev-susfs) driver ready"
+                    else
+                      echo "🔧 Integrating KernelSU Next (pershoot next)..."
+                      curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+                      echo "✅ KernelSU-Next (pershoot next) driver ready"
+                    fi
+                  elif [[ "${{ matrix.kernelsu }}" == "resukisu" ]]; then
+                    echo "🔧 Integrating ReSukiSU..."
+                    curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
+                    echo "✅ ReSukiSU driver ready"
+                  elif [[ "${{ matrix.kernelsu }}" == "sukisu-ultra" ]]; then
+                    if [[ "${{ matrix.susfs }}" == "true" ]]; then
+                      echo "🔧 Integrating SukiSU Ultra (builtin branch for SUSFS)..."
+                      curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
+                      echo "✅ SukiSU Ultra (builtin) driver ready"
+                    else
+                      echo "🔧 Integrating SukiSU Ultra (main branch)..."
+                      curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
+                      echo "✅ SukiSU Ultra (main) driver ready"
+                    fi
+                  elif [[ "${{ matrix.kernelsu }}" == "backslash" ]]; then
+                    echo "🔧 Integrating KernelSU (backslashxx - staging)..."
+                    curl -LSs "https://raw.githubusercontent.com/backslashxx/KernelSU/staging/kernel/setup.sh" | bash -s staging
+                    echo "✅ KernelSU (backslashxx) driver ready"
+                  else
+                    echo "🔧 Integrating KernelSU (tiann - stable)..."
+                    curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash
+                    echo "✅ KernelSU driver ready"
+                  fi
+
+                  # Apply KSU driver SUSFS hook patch (tiann only)
+                  if [[ "${{ matrix.kernelsu }}" == "ksu" && "${{ matrix.susfs }}" == "true" ]]; then
+                    echo "🩹 Applying KSU tiann SUSFS hook patch..."
+                    patch -p1 -d KernelSU \
+                      < scripts/patches/ksu/tiann/0001-susfs-hook-tiann.patch
+                  fi
+
+                  echo "[+] Replacing KSU symlink with physical copy to fix docker mount and inject version..."
+                  if [[ -d "KernelSU-Next" ]]; then
+                    KSU_DIR="KernelSU-Next"
+                  else
+                    KSU_DIR="KernelSU"
+                  fi
+                  # Ensure the repository clone is unshallowed for accurate commit count
+                  # Only run if repo is actually shallow (complete repos error on --unshallow)
+                  cd "$GITHUB_WORKSPACE/$KSU_DIR"
+                  IS_SHALLOW=$(git rev-parse --is-shallow-repository 2>/dev/null || echo "false")
+                  if [[ "$IS_SHALLOW" == "true" ]]; then
+                    git fetch --unshallow 2>/dev/null || true
+                  fi
+                  KSU_GIT_VERSION=$(git rev-list --count HEAD)
+                  cd "$GITHUB_WORKSPACE"
+
+                  # Calculate KSU version code based on the variant type
+                  if [[ "${{ matrix.kernelsu }}" == "sukisu-ultra" || "${{ matrix.kernelsu }}" == "resukisu" ]]; then
+                    # SukiSU / ReSukiSU use version base 40000 and offset 2815
+                    KSU_VERSION=$(expr 40000 + $KSU_GIT_VERSION - 2815)
+                  else
+                    # Tiann and other standard forks use version base 30000 to match newest KSU Manager (32525 etc)
+                    KSU_VERSION=$(expr 30000 + $KSU_GIT_VERSION)
+                  fi
+                  KSU_GIT_TAG=$(cd "$KSU_DIR" && git describe --tags --abbrev=0 2>/dev/null || echo "v4.1.3")
+                  echo "[+] Calculated KSU version code: $KSU_VERSION (Tag: $KSU_GIT_TAG)"
+                  rm -rf drivers/kernelsu
+                  cp -R "$KSU_DIR/kernel" drivers/kernelsu
+
+                  # Find the real (physical) uapi source directory in the cloned KSU repo
+                  REAL_UAPI_SRC=""
+                  if [[ -d "$KSU_DIR/uapi" && ! -L "$KSU_DIR/uapi" ]]; then
+                    REAL_UAPI_SRC="$KSU_DIR/uapi"
+                  elif [[ -d "$KSU_DIR/kernel/include/uapi" && ! -L "$KSU_DIR/kernel/include/uapi" ]]; then
+                    REAL_UAPI_SRC="$KSU_DIR/kernel/include/uapi"
+                  else
+                    # Fallback: resolve symlink if both are linked
+                    RESOLVED_UAPI=$(readlink -f "$KSU_DIR/uapi" 2>/dev/null || true)
+                    if [[ -n "$RESOLVED_UAPI" && -d "$RESOLVED_UAPI" ]]; then
+                      REAL_UAPI_SRC="$RESOLVED_UAPI"
+                    else
+                      RESOLVED_K_UAPI=$(readlink -f "$KSU_DIR/kernel/include/uapi" 2>/dev/null || true)
+                      if [[ -n "$RESOLVED_K_UAPI" && -d "$RESOLVED_K_UAPI" ]]; then
+                        REAL_UAPI_SRC="$RESOLVED_K_UAPI"
+                      fi
+                    fi
+                  fi
+
+                  # Clean any existing uapi symlink/directory and copy the real headers
+                  rm -rf drivers/kernelsu/include/uapi || true
+                  mkdir -p drivers/kernelsu/include/uapi
+                  if [[ -n "$REAL_UAPI_SRC" && -d "$REAL_UAPI_SRC" ]]; then
+                    cp -R "$REAL_UAPI_SRC/." drivers/kernelsu/include/uapi/ 2>/dev/null || true
+                    echo "[+] Successfully copied real KSU uapi headers from $REAL_UAPI_SRC"
+                  else
+                    echo "[!] Warning: Could not locate a valid physical uapi directory in KSU source"
+                  fi
+
+                  # Fix backslash-susfs compile: #include "uapi/app_profile.h" inside supercall.h
+                  # expects drivers/kernelsu/include/uapi/uapi/app_profile.h to exist.
+                  # We create a self-referencing symlink 'uapi' inside uapi/ directory ONLY for backslashxx.
+                  # This will resolve 'uapi/app_profile.h' to 'app_profile.h' inside that directory.
+                  if [[ "${{ matrix.kernelsu }}" == "backslash" ]]; then
+                    cd drivers/kernelsu/include/uapi
+                    ln -sf . uapi
+                    cd "$GITHUB_WORKSPACE"
+                    echo "[+] Created uapi -> . self-referencing symlink for backslash compile compatibility"
+                  fi
+                  # ReSukiSU Kbuild checks for a .git marker in the parent (drivers/) directory
+                  # Create a dummy marker so the submodule check passes without a real git repo
+                  if [[ "${{ matrix.kernelsu }}" == "resukisu" ]]; then
+                    # KSU_SRC = drivers/kernelsu, check is: test -e $(KSU_SRC)/../.git = drivers/.git
+                    git init drivers/kernelsu
+                    git -C drivers/kernelsu config user.email "ci@build.local"
+                    git -C drivers/kernelsu config user.name "CI"
+                    git -C drivers/kernelsu commit --allow-empty -m "init" --no-gpg-sign
+                    # Also create drivers/.git so the Kbuild parent-dir check passes
+                    touch drivers/.git
+                  fi
+                  for kfile in drivers/kernelsu/Kbuild drivers/kernelsu/Makefile; do
+                     if [[ -f "$kfile" ]]; then
+                       sed -i "s|ccflags-y += -DKSU_VERSION=16|ccflags-y += -DKSU_VERSION=$KSU_VERSION|g" "$kfile" || true
+                        sed -i "s|ccflags-y += -DKSU_VERSION=\$(KSU_VERSION)|ccflags-y += -DKSU_VERSION=$KSU_VERSION|g" "$kfile" || true
+                        sed -i "s|KSU_VERSION := [0-9][0-9]*|KSU_VERSION := $KSU_VERSION|g" "$kfile" || true
+                       sed -i "s|KSU_VERSION_FALLBACK := [0-9][0-9]*|KSU_VERSION_FALLBACK := $KSU_VERSION|g" "$kfile" || true
+                       sed -i "s|KSU_VERSION_TAG_FALLBACK := v0.0.1|KSU_VERSION_TAG_FALLBACK := $KSU_GIT_TAG|g" "$kfile" || true
+                        sed -i "s|KSU_VERSION_TAG_FALLBACK := v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*|KSU_VERSION_TAG_FALLBACK := $KSU_GIT_TAG|g" "$kfile" || true
+                     fi
+                   done
+
+                   # Force LKM mode flag so that GKI warning banner is not shown in Manager for ksu and ksu-susfs
+                   if [[ "${{ matrix.kernelsu }}" == "ksu" ]]; then
+                     for dispatch_file in drivers/kernelsu/supercall/dispatch.c drivers/kernelsu/kernel/supercall/dispatch.c; do
+                       if [[ -f "$dispatch_file" ]]; then
+                         echo "[+] Patching $dispatch_file to define KSU_GET_INFO_FLAG_LKM unconditionally..."
+                         sed -i 's/#ifdef MODULE/#if 1/g' "$dispatch_file" || true
+                       fi
+                     done
+                   fi
+
+                   echo "✅ KSU setup complete"
+
+            - name: Apply SUSFS patches
+              if: matrix.susfs == 'true'
+              run: |
+                  set -euo pipefail
+                  cd "$GITHUB_WORKSPACE"
+
+                  echo "🩹 Applying SUSFS kernel patch..."
+                  patch -p1 --forward < scripts/patches/kernel/0001-susfs-for-samsung-s5e8835.patch \
+                    || echo "  ⚠️  Some hunks in SUSFS patch were skipped (expected for partial apply)"
+
+                  # Add SUSFS_VERSION info to kernel/Makefile
+                  if ! grep -q "SUSFS_VERSION" kernel/Makefile 2>/dev/null; then
+                    echo "🔧 Adding SUSFS_VERSION to kernel/Makefile..."
+                    echo "" >> kernel/Makefile
+                    echo "## For susfs stuff ##" >> kernel/Makefile
+                    echo "ifeq (\$(shell test -e \$(srctree)/fs/susfs.c; echo \$\$\?),0)" >> kernel/Makefile
+                    echo "\$(eval SUSFS_VERSION=\$(shell cat \$(srctree)/include/linux/susfs.h | grep -E '^#define SUSFS_VERSION' | cut -d' ' -f3 | sed 's/\"//g'))" >> kernel/Makefile
+                    echo "\$(info )" >> kernel/Makefile
+                    echo "\$(info -- SUSFS_VERSION: \$(SUSFS_VERSION))" >> kernel/Makefile
+                    echo "else" >> kernel/Makefile
+                    echo "\$(info -- SUSFS: susfs.c not found, SUSFS not integrated)" >> kernel/Makefile
+                    echo "endif" >> kernel/Makefile
+                  fi
+
+                  find . -name '*.rej' -delete 2>/dev/null || true
+                  echo "✅ SUSFS patches applied cleanly"
+
+            - name: Apply BBRv3 & NTSYNC patches
+              run: |
+                  set -euo pipefail
+                  cd "$GITHUB_WORKSPACE"
+
+                  echo "🩹 Applying BBRv3 patch..."
+                  patch -p1 --forward < scripts/patches/kernel/0002-bbrv3-android13-5.15.patch
+
+                  echo "🩹 Applying NTSYNC patch..."
+                  patch -p1 --forward < scripts/patches/kernel/0003-ntsync-android13-5.15.patch
+
+                  find . -name '*.rej' -delete 2>/dev/null || true
+                  echo "✅ BBRv3 & NTSYNC patches applied cleanly"
+
+            - name: Configure build options
+              run: |
+                  set -euo pipefail
+                  cd "$GITHUB_WORKSPACE"
+                  echo "⚙️  Generating custom.config..."
+                  touch arch/arm64/configs/custom.config
+
+                  # Base config options
+                  ./scripts/config --file arch/arm64/configs/custom.config --enable CONFIG_SLUB_DEBUG
+                  ./scripts/config --file arch/arm64/configs/custom.config --disable CONFIG_SCHED_AUTOGROUP
+
+                  if [[ "${{ matrix.permissive }}" == "true" ]]; then
+                    echo "⚙️ Enabling Permissive Mode..."
+                    ./scripts/config --file arch/arm64/configs/custom.config --disable CONFIG_SECURITY_SELINUX_DEVELOP
+                  fi
+
+                  if [[ "${{ matrix.kernelsu }}" != "none" ]]; then
+                    echo "⚙️ Enabling KernelSU..."
+                    ./scripts/config --file arch/arm64/configs/custom.config --enable CONFIG_KSU
+                    ./scripts/config --file arch/arm64/configs/custom.config --disable CONFIG_KSU_KPROBES_HOOK
+                  fi
+
+                  if [[ "${{ matrix.susfs }}" == "true" ]]; then
+                    echo "⚙️ Enabling SUSFS..."
+                    ./scripts/config --file arch/arm64/configs/custom.config \
+                      --enable CONFIG_KSU_SUSFS \
+                      --enable CONFIG_KSU_SUSFS_SUS_PATH \
+                      --enable CONFIG_KSU_SUSFS_SUS_MOUNT \
+                      --enable CONFIG_KSU_SUSFS_SUS_KSTAT \
+                      --disable CONFIG_KSU_SUSFS_SUS_OVERLAYFS \
+                      --enable CONFIG_KSU_SUSFS_TRY_UMOUNT \
+                      --enable CONFIG_KSU_SUSFS_SPOOFER \
+                      --enable CONFIG_KSU_SUSFS_OPEN_REDIRECT \
+                      --disable CONFIG_KSU_SUSFS_SUS_SU
+                  fi
+
+                   # Disable auto local version to prevent -dirty suffix
+                  ./scripts/config --file arch/arm64/configs/custom.config --disable CONFIG_LOCALVERSION_AUTO
+                  # Set custom LOCALVERSION
+                  ./scripts/config --file arch/arm64/configs/custom.config --set-str CONFIG_LOCALVERSION "${{ env.BUILD_LOCALVERSION }}"
+
+                  # TMPFS XATTR is always enabled (mountify)
+                  ./scripts/config --file arch/arm64/configs/custom.config --enable CONFIG_TMPFS_XATTR
+
+                  # BBG is always enabled
+                  ./scripts/config --file arch/arm64/configs/custom.config --enable CONFIG_BBG
+
+                  echo "✅ Build configuration ready"
+                  echo "--- custom.config ---"
+                  cat arch/arm64/configs/custom.config
+
+            - name: Build kernel
+              run: |
+                  set -euo pipefail
+                  cd "$GITHUB_WORKSPACE"
+                  export PATH="${{ env.TOOLCHAIN_DIR }}/bin:$PATH"
+                  export KBUILD_BUILD_HOST="Github-Actions"
+                  export KBUILD_BUILD_USER="bizarre"
+                  export PLATFORM_VERSION=16
+                  export TARGET_SOC=s5e8835
+
+                  MAKE_PARAMS="-j$(nproc --all) ARCH=arm64 KBUILD_OUTPUT=$GITHUB_WORKSPACE/out CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- LOCALVERSION="
+
+                  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                  echo "🏗️  Starting Bizarre Kernel build"
+                  echo "   Variant    : ${{ matrix.variant }}"
+                  echo "   Threads    : $(nproc --all)"
+                  echo "   Clang      : $(clang --version | head -1)"
+                  echo "   Output     : $GITHUB_WORKSPACE/out"
+                  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+                  echo "⚙️  Generating .config from bizarre_defconfig + custom.config..."
+                  make $MAKE_PARAMS bizarre_defconfig custom.config
+
+                  echo ""
+                  echo "🔨 Compiling kernel & DTBs..."
+                  BUILD_START=$(date +%s)
+                  make $MAKE_PARAMS && make $MAKE_PARAMS dtbs
+                  BUILD_END=$(date +%s)
+                  BUILD_ELAPSED=$(( BUILD_END - BUILD_START ))
+
+                  echo ""
+                  echo "✅ Kernel compiled in $(( BUILD_ELAPSED / 60 ))m $(( BUILD_ELAPSED % 60 ))s"
+                  echo "BUILD_ELAPSED=$BUILD_ELAPSED" >> "$GITHUB_ENV"
+
+            - name: Verify kernel build
+              run: |
+                  IMAGE_PATH="$GITHUB_WORKSPACE/out/arch/arm64/boot/Image"
+                  if [[ ! -f "$IMAGE_PATH" ]]; then
+                    echo "❌ Kernel Image not found — build failed!"
+                    exit 1
+                  fi
+                  IMAGE_SIZE=$(du -sh "$IMAGE_PATH" | cut -f1)
+                  echo "✅ Kernel Image found — Size: $IMAGE_SIZE"
+                  echo "IMAGE_SIZE=$IMAGE_SIZE" >> "$GITHUB_ENV"
+
+            - name: Collect DTBOs per device
+              run: |
+                  set -euo pipefail
+                  OUT=$GITHUB_WORKSPACE/out/arch/arm64/boot
+
+                  echo "📦 Packing M35x DTBOs..."
+                  python3 scripts/mkdtboimg.py create \
+                    dtbo-m35x.img \
+                    $(ls $OUT/dts/samsung/m35x/*.dtbo | sort)
+
+                  echo "📦 Packing A35x DTBOs..."
+                  python3 scripts/mkdtboimg.py create \
+                    dtbo-a35x.img \
+                    $(ls $OUT/dts/samsung/a35x/*.dtbo | sort)
+
+                  echo "✅ DTBOs ready"
+
+            - name: Create flashable zip
+              run: |
+                  set -euo pipefail
+                  KERNEL_NAME_RAW="${{ env.BUILD_LOCALVERSION }}"
+                  KERNEL_NAME_RAW="${KERNEL_NAME_RAW#-}"
+                  ZIP_NAME="${KERNEL_NAME_RAW}-${{ env.DATE }}.zip"
+
+                  echo "📦 Packaging into $ZIP_NAME..."
+                  cp "$GITHUB_WORKSPACE/out/arch/arm64/boot/Image" "$HOME/AnyKernel3/"
+                  cp dtbo-m35x.img "$HOME/AnyKernel3/"
+                  cp dtbo-a35x.img "$HOME/AnyKernel3/"
+
+                  # Remove module processing from main AnyKernel3 to keep kernel size small (~21MB)
+                  rm -rf "$HOME/AnyKernel3/modules"
+                  sed -i 's/do.modules=1/do.modules=0/g' "$HOME/AnyKernel3/anykernel.sh"
+                  sed -i 's/do.systemless=1/do.systemless=0/g' "$HOME/AnyKernel3/anykernel.sh"
+
+                  cd "$HOME/AnyKernel3"
+                  7z a "$ZIP_NAME" . -xr'!*.git*' | tail -1
+
+                  ZIP_SIZE=$(du -sh "$ZIP_NAME" | cut -f1)
+                  echo "✅ Zip created — Size: $ZIP_SIZE"
+                  echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+                  echo "ZIP_SIZE=$ZIP_SIZE" >> "$GITHUB_ENV"
+
+                  # -------------------------------------------------------------
+            - name: Upload kernel artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: Bizarre-Kernel-${{ matrix.variant }}-${{ env.DATE }}
+                  path: /home/runner/AnyKernel3/*.zip
+                  if-no-files-found: error
+                  retention-days: 7
+
+    publish-release:
+        name: Publish GitHub Release
+        needs: [build]
+        runs-on: ubuntu-latest
+        if: >-
+            !cancelled()
+            && needs.build.result == 'success'
+        steps:
+            - name: Set date
+              id: date
+              run: echo "DATE=$(date +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+
+            - name: Download kernel artifacts
+              uses: actions/download-artifact@v4
+              with:
+                  pattern: Bizarre-Kernel-*
+                  path: /home/runner/release
+                  merge-multiple: true
+
+            - name: Publish to GitHub Releases
+              uses: softprops/action-gh-release@v2.6.1
+              with:
+                  files: /home/runner/release/*.zip
+                  name: Bizarre Kernel - ${{ steps.date.outputs.DATE }}
+                  tag_name: ${{ steps.date.outputs.DATE }}
+                  prerelease: ${{ github.event.inputs.prerelease == 'true' }}
+                  overwrite_files: true
+                  body: |
+                      ### Bizarre Kernel for Galaxy A54, A35 & M35 (Exynos 1380 / s5e8835)
+
+                      ### 🚀 Dynamic Features
+                      - **KernelSU-Next / KernelSU (tiann stable):** Dynamic build-time integrations.
+                      - **SUSFS Spoofing:** Complete stealth systemlessly hiding root status.
+                      - **Droidspace & Docker Support:** Full isolated namespace routing & System V IPC kABI preservation.
+                      - **NetHunter Support:** Native USB HID (BadUSB) injection support.
+                      - **Overhead Optimization:** Disabled Knox (`DEFEX`, `PROCA`, `FIVE`), stripped Samsung ACPM debugging levels, and GMS Stealth integrations to pass Google Play Integrity out of the box.
+
+                      ### 📲 Flashing Instructions
+                      1. **Kernel:** Download and flash the matching variant ZIP (e.g., `bizarrekernel-ksu+susfs-2026-07-07.zip`) using TWRP / OrangeFox or FKM.
+
+                      ### 🛠️ Build Specs
+                      - **Kernel Base:** android13-5.15 (LTS ${{ steps.date.outputs.DATE }})
+                      - **Toolchain:** Google Clang r450784d (LTO optimized)
+                      - **Target Platforms:** One UI 8.0 & 8.5 (Android 16)
+                      - **Selected Dispatch Variant:** `${{ github.event.inputs.variant || 'all' }}`
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    notify-release:
+        name: Send Release Notification
+        runs-on: ubuntu-latest
+        needs: [publish-release]
+        if: github.event.inputs.notifications == 'true' && needs.publish-release.result == 'success'
+        steps:
+            - name: Set date
+              id: date
+              run: echo "DATE=$(date +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+
+            - name: Send Telegram Release Notification
+              run: |
+                  curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+                    -F chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+                    -F message_thread_id="${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}" \
+                    -F parse_mode="Markdown" \
+                    -F disable_web_page_preview=true \
+                    -F text="$(printf '%s\n' \
+                      '🎉 *New Bizarre Kernel Release*' \
+                      '━━━━━━━━━━━━━━━━━━━━━━' \
+                      '🗓️ *Date:* \`${{ steps.date.outputs.DATE }}\`' \
+                      '📱 *Devices:* \`Galaxy M35 + A35 (s5e8835)\`' \
+                      '━━━━━━━━━━━━━━━━━━━━━━' \
+                      '📥 [Download from GitHub Releases](https://github.com/${{ github.repository }}/releases/tag/${{ steps.date.outputs.DATE }})')"
