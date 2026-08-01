@@ -1,6 +1,0 @@
-config ISA1000_VIBRATOR
-	tristate "isa1000 vibrator"
-	default n
-	help
-	  If you say yes here you will get support for the
-	  isa1000 vibrator driver

@@ -1,2 +1,0 @@
-source "drivers/if-pmic/maxim/usb/typec/maxim/max77705/Kconfig"
-
