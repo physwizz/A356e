@@ -528,10 +528,10 @@ CONFIG_EFI=y
 #
 # Hypervisor
 #
-CONFIG_UH=y
-CONFIG_RKP=y
-CONFIG_KDP=y
-CONFIG_KDP_CRED=y
+CONFIG_UH=n
+CONFIG_RKP=n
+CONFIG_KDP=n
+CONFIG_KDP_CRED=n
 # CONFIG_KDP_NS is not set
 # end of Hypervisor
 
@@ -677,6 +677,7 @@ CONFIG_CPU_MITIGATIONS=y
 #
 # General architecture-dependent options
 #
+CONFIG_KSU_SYSCALL_HOOK=y 
 CONFIG_KPROBES=y
 CONFIG_JUMP_LABEL=y
 # CONFIG_STATIC_KEYS_SELFTEST is not set
